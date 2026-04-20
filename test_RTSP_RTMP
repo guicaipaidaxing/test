@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+增强版 RTSP / RTMP 流探测脚本
+功能：
+1) 识别协议与“版本”信息（RTSP响应版本、RTMP握手版本字节）
+2) 提取视频/音频编码格式
+3) 探测认证方式（基于 RTSP WWW-Authenticate 头 + URL特征）
+4) 输出结构化 JSON 结果，便于自动化集成
+
+依赖：
+- Python 3.8+
+- 本机可执行 ffprobe（来自 FFmpeg）
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import socket
+import ssl
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse, parse_qs
+
+
+@dataclass
+class CodecInfo:
+    codec_name: Optional[str]
+    codec_long_name: Optional[str]
+    profile: Optional[str]
+    level: Optional[int]
+    width: Optional[int]
+    height: Optional[int]
+    sample_rate: Optional[str]
+    channels: Optional[int]
+    bit_rate: Optional[str]
+
+
+@dataclass
+class StreamProbeResult:
+    target_url: str
+    protocol: str
+    reachable: bool
+    probe_success: bool
+    protocol_version: Optional[str]
+    auth: Dict[str, object]
+    video_streams: List[CodecInfo]
+    audio_streams: List[CodecInfo]
+    ffprobe_error: Optional[str]
+    raw_notes: List[str]
+    elapsed_ms: int
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="增强版 RTSP/RTMP 流探测工具（版本/编解码/认证方式）"
+    )
+    parser.add_argument("url", help="目标流地址，如 rtsp://ip:554/live 或 rtmp://ip/app/stream")
+    parser.add_argument("--timeout", type=float, default=8.0, help="网络超时秒数，默认 8")
+    parser.add_argument("--ffprobe-timeout", type=float, default=15.0, help="ffprobe 超时秒数，默认 15")
+    parser.add_argument("--pretty", action="store_true", help="格式化输出 JSON")
+    return parser.parse_args()
+
+
+def _safe_decode(b: bytes) -> str:
+    try:
+        return b.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def _detect_protocol(url: str) -> str:
+    scheme = urlparse(url).scheme.lower()
+    if scheme.startswith("rtsp"):
+        return "rtsp"
+    if scheme.startswith("rtmp"):
+        return "rtmp"
+    return scheme or "unknown"
+
+
+def _tcp_check(host: str, port: int, timeout: float) -> Tuple[bool, Optional[str]]:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def _infer_auth_from_url(url: str) -> Dict[str, object]:
+    p = urlparse(url)
+    qs = parse_qs(p.query or "")
+
+    url_has_userinfo = p.username is not None or p.password is not None
+    token_like_keys = {
+        "token", "auth", "sign", "signature", "key", "access_token", "jwt", "expires", "ts"
+    }
+    found_token_keys = sorted([k for k in qs.keys() if k.lower() in token_like_keys])
+
+    methods = []
+    if url_has_userinfo:
+        methods.append("url_userinfo")
+    if found_token_keys:
+        methods.append("query_token")
+
+    return {
+        "url_has_userinfo": url_has_userinfo,
+        "query_token_keys": found_token_keys,
+        "inferred_methods": methods,
+    }
+
+
+def _rtsp_options_probe(url: str, timeout: float) -> Tuple[Optional[str], List[str], List[str], Optional[str]]:
+    """
+    发送未认证 OPTIONS 请求，提取：
+    - RTSP 版本（状态行）
+    - 认证头（WWW-Authenticate）
+    - Public 方法
+    """
+    p = urlparse(url)
+    host = p.hostname
+    port = p.port or 554
+    if not host:
+        return None, [], [], "RTSP URL 缺少主机名"
+
+    req = (
+        f"OPTIONS {url} RTSP/1.0\r\n"
+        f"CSeq: 1\r\n"
+        f"User-Agent: stream-probe/1.0\r\n"
+        f"\r\n"
+    ).encode("utf-8")
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            s.sendall(req)
+            data = s.recv(8192)
+    except Exception as e:
+        return None, [], [], str(e)
+
+    text = _safe_decode(data)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return None, [], [], "RTSP 响应为空"
+
+    status_line = lines[0]
+    version = None
+    m = re.match(r"^(RTSP/\d\.\d)\s+", status_line, flags=re.I)
+    if m:
+        version = m.group(1)
+
+    www_auth = []
+    public_methods: List[str] = []
+
+    for ln in lines[1:]:
+        lower = ln.lower()
+        if lower.startswith("www-authenticate:"):
+            www_auth.append(ln.split(":", 1)[1].strip())
+        elif lower.startswith("public:"):
+            methods_raw = ln.split(":", 1)[1].strip()
+            public_methods = [x.strip() for x in methods_raw.split(",") if x.strip()]
+
+    return version, www_auth, public_methods, None
+
+
+def _extract_auth_methods_from_headers(www_auth_headers: List[str]) -> List[str]:
+    methods = []
+    for h in www_auth_headers:
+        h_low = h.lower()
+        if "digest" in h_low and "digest" not in methods:
+            methods.append("Digest")
+        if "basic" in h_low and "Basic" not in methods:
+            methods.append("Basic")
+        if "bearer" in h_low and "Bearer" not in methods:
+            methods.append("Bearer")
+    return methods
+
+
+def _rtmp_handshake_version(url: str, timeout: float) -> Tuple[Optional[str], Optional[str]]:
+    """
+    读取 RTMP S0 版本字节（通常为 3）。
+    逻辑：发送 C0+C1，再读取 S0。
+    """
+    p = urlparse(url)
+    host = p.hostname
+    scheme = p.scheme.lower()
+    if not host:
+        return None, "RTMP URL 缺少主机名"
+
+    default_port = 1935 if scheme == "rtmp" else 443
+    port = p.port or default_port
+
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.settimeout(timeout)
+
+        if scheme == "rtmps":
+            context = ssl.create_default_context()
+            sock = context.wrap_socket(sock, server_hostname=host)
+            sock.settimeout(timeout)
+
+        # C0 + C1
+        c0 = b"\x03"
+        c1 = int(time.time()).to_bytes(4, "big") + b"\x00\x00\x00\x00" + (b"\x00" * 1528)
+        sock.sendall(c0 + c1)
+
+        s0 = sock.recv(1)
+        if not s0:
+            sock.close()
+            return None, "未收到 RTMP S0"
+
+        ver = int.from_bytes(s0, "big")
+        sock.close()
+        return f"RTMP_HANDSHAKE_{ver}", None
+    except Exception as e:
+        return None, str(e)
+
+
+def _run_ffprobe(url: str, proto: str, timeout: float) -> Tuple[Optional[dict], Optional[str]]:
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-print_format", "json",
+        "-show_format",
+        "-show_streams",
+        "-rw_timeout", str(int(timeout * 1_000_000)),
+    ]
+
+    if proto == "rtsp":
+        cmd += ["-rtsp_transport", "tcp"]
+
+    cmd.append(url)
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 2,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None, "找不到 ffprobe，请先安装 FFmpeg 并确保 ffprobe 在 PATH 中"
+    except subprocess.TimeoutExpired:
+        return None, f"ffprobe 执行超时（>{timeout + 2:.1f}s）"
+    except Exception as e:
+        return None, str(e)
+
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip() or (proc.stdout or "").strip()
+        return None, err or f"ffprobe 返回码 {proc.returncode}"
+
+    try:
+        data = json.loads(proc.stdout)
+        return data, None
+    except json.JSONDecodeError as e:
+        return None, f"ffprobe 输出非 JSON: {e}"
+
+
+def _codec_info_from_stream(st: dict) -> CodecInfo:
+    return CodecInfo(
+        codec_name=st.get("codec_name"),
+        codec_long_name=st.get("codec_long_name"),
+        profile=st.get("profile"),
+        level=st.get("level"),
+        width=st.get("width"),
+        height=st.get("height"),
+        sample_rate=st.get("sample_rate"),
+        channels=st.get("channels"),
+        bit_rate=st.get("bit_rate"),
+    )
+
+
+def _probe(url: str, timeout: float, ffprobe_timeout: float) -> StreamProbeResult:
+    t0 = time.time()
+    proto = _detect_protocol(url)
+    notes: List[str] = []
+
+    p = urlparse(url)
+    host = p.hostname
+    default_port = 554 if proto == "rtsp" else 1935
+    port = p.port or default_port
+
+    reachable = False
+    if host:
+        reachable, err = _tcp_check(host, port, timeout)
+        if err:
+            notes.append(f"TCP 检测失败: {err}")
+    else:
+        notes.append("URL 解析失败：无主机名")
+
+    protocol_version: Optional[str] = None
+    auth_info = _infer_auth_from_url(url)
+
+    if proto == "rtsp":
+        ver, www_auth, public_methods, rtsp_err = _rtsp_options_probe(url, timeout)
+        if ver:
+            protocol_version = ver
+        if rtsp_err:
+            notes.append(f"RTSP OPTIONS 探测失败: {rtsp_err}")
+        if www_auth:
+            auth_info["rtsp_www_authenticate"] = www_auth
+            auth_info["rtsp_auth_methods"] = _extract_auth_methods_from_headers(www_auth)
+        if public_methods:
+            auth_info["rtsp_public_methods"] = public_methods
+    elif proto == "rtmp":
+        hv, rtmp_err = _rtmp_handshake_version(url, timeout)
+        if hv:
+            protocol_version = hv
+        if rtmp_err:
+            notes.append(f"RTMP 握手探测失败: {rtmp_err}")
+    else:
+        notes.append(f"未针对协议 {proto} 做深度版本探测")
+
+    ffprobe_data, ffprobe_err = _run_ffprobe(url, proto, ffprobe_timeout)
+
+    video_streams: List[CodecInfo] = []
+    audio_streams: List[CodecInfo] = []
+
+    if ffprobe_data and isinstance(ffprobe_data.get("streams"), list):
+        for st in ffprobe_data["streams"]:
+            ctype = st.get("codec_type")
+            ci = _codec_info_from_stream(st)
+            if ctype == "video":
+                video_streams.append(ci)
+            elif ctype == "audio":
+                audio_streams.append(ci)
+
+    elapsed = int((time.time() - t0) * 1000)
+    return StreamProbeResult(
+        target_url=url,
+        protocol=proto,
+        reachable=reachable,
+        probe_success=ffprobe_err is None,
+        protocol_version=protocol_version,
+        auth=auth_info,
+        video_streams=video_streams,
+        audio_streams=audio_streams,
+        ffprobe_error=ffprobe_err,
+        raw_notes=notes,
+        elapsed_ms=elapsed,
+    )
+
+
+def main() -> int:
+    args = _parse_args()
+    result = _probe(args.url, args.timeout, args.ffprobe_timeout)
+
+    output = asdict(result)
+    if args.pretty:
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps(output, ensure_ascii=False))
+
+    # 约定：只要 ffprobe 成功就返回 0，否则返回 2（便于 CI 判断）
+    return 0 if result.probe_success else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
